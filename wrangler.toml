@@ -1,6 +1,7 @@
 name = "reitit-cf-demo"
 main = "./out/main.js"
 compatibility_date = "2024-01-01"
+account_id = "35fae887cc4db5aef040a2e9cab81c04"
 
 [assets]
 directory = "./public"
