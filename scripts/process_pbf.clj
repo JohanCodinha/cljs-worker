@@ -412,23 +412,70 @@
         (filter #(= 1 (:precis %)))
         (map #(dissoc % :precis))))
 
-(defn xf-add-slug
-  "Add unique slug to each place. seen-slugs is an atom for deduplication."
-  [seen-slugs]
-  (map (fn [{:keys [name state type] :as place}]
-         (assoc place :slug (unique-slug seen-slugs name state type)))))
+(def settlement-types
+  "Place types representing human settlements (as opposed to natural features)."
+  #{"city" "town" "suburb" "village" "hamlet" "locality" "neighbourhood"})
 
-(defn geojson-line->places
-  "Transducer pipeline for processing GeoJSON features into places with BOM locations"
-  [bom-locations seen-slugs batch-size]
+(defn prefer-points
+  "If any Point geometries exist, keep only Points. Otherwise keep all."
+  [places]
+  (let [points (filter #(= "Point" (:geom-type %)) places)]
+    (if (seq points)
+      points
+      places)))
+
+(defn dedupe-by-proximity
+  "Dedupe places within distance-km of each other.
+   Keeps places that are >distance-km apart.
+   Prefers higher importance entries."
+  [distance-km places]
+  (let [sorted (sort-by #(- (:importance % 0)) places)]
+    (reduce
+      (fn [kept place]
+        (if (some #(< (equirectangular-distance (:lat place) (:lon place)
+                                                (:lat %) (:lon %))
+                      distance-km)
+                  kept)
+          kept  ; dominated by a better place nearby
+          (conj kept place)))
+      []
+      sorted)))
+
+(defn dedupe-settlements
+  "Remove duplicate settlements with same name/state within distance-km.
+   If any Point geometries exist for a name/state, Polygon centroids are dropped.
+   Then dedupes by proximity, preferring higher importance.
+   Non-settlement types pass through unchanged."
+  [distance-km places]
+  (let [{settlements true, others false}
+        (group-by #(contains? settlement-types (:type %)) places)]
+    (into
+     ;; Dedupe settlements: group by name+state, prefer points, cluster by proximity
+     (->> (or settlements [])
+          (group-by (juxt :name :state))
+          vals
+          (mapcat (comp #(dedupe-by-proximity distance-km %) prefer-points)))
+     ;; Non-settlements pass through unchanged
+     (or others []))))
+
+(defn xf-parse-geojson
+  "Transducer pipeline for parsing GeoJSON features into enriched places.
+   Does not add slugs - that happens after deduplication."
+  [bom-locations]
   (comp (map parse-geojson-line)
         (filter some?)
         (keep feature->place)
         (remove #(str/blank? (:name %)))
         (xf-determine-type importance)
-        (xf-add-bom-location bom-locations)
-        (xf-add-slug seen-slugs)
-        (partition-all batch-size)))
+        (xf-add-bom-location bom-locations)))
+
+(defn add-slugs
+  "Add unique slugs to a collection of places.
+   seen-slugs is an atom for tracking used slugs."
+  [seen-slugs places]
+  (mapv (fn [{:keys [name state type] :as place}]
+          (assoc place :slug (unique-slug seen-slugs name state type)))
+        places))
 
 (defn add-nearest-observation-stations
   "Add nearest observation stations to a BOM location.
@@ -594,11 +641,16 @@
                     (.write writer (str (bom-obs-station->sql aac station) ";\n")))
                   all-obs-stations)
             (println "Processing OSM places...")
-            (let [seen-slugs (atom #{})]
+            (let [all-places (into [] (xf-parse-geojson bom-locations) (line-seq geojson-reader))
+                  _ (println "  Parsed" (count all-places) "places from OSM")
+                  deduped (dedupe-settlements 10.0 all-places)
+                  _ (println "  After deduplication:" (count deduped) "places"
+                             (str "(" (- (count all-places) (count deduped)) " duplicates removed)"))
+                  seen-slugs (atom #{})
+                  with-slugs (add-slugs seen-slugs deduped)]
               (run! #(.write writer (str (batch->sql %) ";\n"))
-                    (sequence (geojson-line->places bom-locations seen-slugs batch-size)
-                              (line-seq geojson-reader)))
-              (println "Generated" (count @seen-slugs) "unique slugs"))))
+                    (partition-all batch-size with-slugs))
+              (println "  Generated" (count @seen-slugs) "unique slugs"))))
         (let [exit-code (.waitFor osmium-geojsonseq-export-process)]
           (when-not (zero? exit-code)
             (throw (ex-info "osmium export process failed"
