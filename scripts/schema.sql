@@ -30,6 +30,7 @@ CREATE INDEX IF NOT EXISTS idx_bom_state ON bom_locations(state);
 CREATE TABLE IF NOT EXISTS places (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
+  slug TEXT NOT NULL UNIQUE,  -- URL-friendly identifier
   type TEXT NOT NULL,
   subtype TEXT,
   state TEXT,
@@ -47,6 +48,7 @@ CREATE TABLE IF NOT EXISTS places (
 
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_name ON places(name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_slug ON places(slug);
 CREATE INDEX IF NOT EXISTS idx_type ON places(type);
 CREATE INDEX IF NOT EXISTS idx_state ON places(state);
 CREATE INDEX IF NOT EXISTS idx_bom_aac ON places(bom_aac);

@@ -46,6 +46,36 @@
 (def ^:const EARTH_RADIUS_KM 6371.0)
 (def ^:const DEG_TO_RAD (/ Math/PI 180.0))
 
+(defn slugify
+  "Convert a place name and state to a URL-friendly slug.
+   Example: 'Harcourt North' + 'VIC' → 'harcourt-north-vic'"
+  [name state]
+  (-> (str name "-" state)
+      str/lower-case
+      (str/replace #"[^a-z0-9]+" "-")
+      (str/replace #"^-|-$" "")))
+
+(defn unique-slug
+  "Generate a unique slug, appending type or numeric suffix if needed.
+   seen-slugs is an atom containing a set of already-used slugs."
+  [seen-slugs name state type]
+  (let [base-slug (slugify name state)]
+    (if-not (contains? @seen-slugs base-slug)
+      (do (swap! seen-slugs conj base-slug)
+          base-slug)
+      ;; Try with type appended
+      (let [typed-slug (str base-slug "-" (str/replace (or type "") #"[^a-z0-9]+" "-"))]
+        (if-not (contains? @seen-slugs typed-slug)
+          (do (swap! seen-slugs conj typed-slug)
+              typed-slug)
+          ;; Append numeric suffix
+          (loop [n 2]
+            (let [numbered-slug (str typed-slug "-" n)]
+              (if-not (contains? @seen-slugs numbered-slug)
+                (do (swap! seen-slugs conj numbered-slug)
+                    numbered-slug)
+                (recur (inc n))))))))))
+
 ;; BOM observation feed URLs by state
 (def observation-feeds
   {"VIC" "http://reg.bom.gov.au/fwo/IDV60920.xml"
@@ -338,9 +368,9 @@
 
 (defn place->values-row
   "Convert a place map to a values row for batch insert"
-  [{:keys [name lat lon type subtype state osm-id importance
+  [{:keys [name slug lat lon type subtype state osm-id importance
            bom-aac bom-distance-km]}]
-  [name type subtype state osm-id (or importance 0)
+  [name slug type subtype state osm-id (or importance 0)
    lat lon bom-aac bom-distance-km])
 
 (defn batch->sql
@@ -348,7 +378,7 @@
   [places]
   (first
     (sql/format {:insert-into :places
-                 :columns [:name :type :subtype :state :osm_id :importance
+                 :columns [:name :slug :type :subtype :state :osm_id :importance
                            :lat :lon :bom_aac :bom_distance_km]
                  :values (mapv place->values-row places)}
                 {:inline true})))
@@ -369,15 +399,22 @@
         (filter #(= 1 (:precis %)))
         (map #(dissoc % :precis))))
 
+(defn xf-add-slug
+  "Add unique slug to each place. seen-slugs is an atom for deduplication."
+  [seen-slugs]
+  (map (fn [{:keys [name state type] :as place}]
+         (assoc place :slug (unique-slug seen-slugs name state type)))))
+
 (defn geojson-line->places
   "Transducer pipeline for processing GeoJSON features into places with BOM locations"
-  [bom-locations batch-size]
+  [bom-locations seen-slugs batch-size]
   (comp (map parse-geojson-line)
         (filter some?)
         (keep feature->place)
         (remove #(str/blank? (:name %)))
         (xf-determine-type importance)
         (xf-add-bom-location bom-locations)
+        (xf-add-slug seen-slugs)
         (partition-all batch-size)))
 
 (defn add-nearest-observation-station
@@ -518,14 +555,18 @@
                 _ (println "Computing nearest observation station for" (count bom-locations-raw) "BOM locations...")
                 bom-locations (mapv (partial add-nearest-observation-station obs-stations)
                                     bom-locations-raw)]
-            (.write writer (slurp "scripts/schema.sql"))
+            ;; schema.sql is in same directory as config file
+            (let [config-dir (.getParent (io/file (first *command-line-args*)))]
+              (.write writer (slurp (io/file config-dir "schema.sql"))))
             (.write writer (metadata->sql sources refreshed-at))
             (run! #(.write writer (str (bom-location->sql %) ";\n"))
                   bom-locations)
             (println "Processing OSM places...")
-            (run! #(.write writer (str (batch->sql %) ";\n"))
-                  (sequence (geojson-line->places bom-locations batch-size)
-                            (line-seq geojson-reader)))))
+            (let [seen-slugs (atom #{})]
+              (run! #(.write writer (str (batch->sql %) ";\n"))
+                    (sequence (geojson-line->places bom-locations seen-slugs batch-size)
+                              (line-seq geojson-reader)))
+              (println "Generated" (count @seen-slugs) "unique slugs"))))
         (let [exit-code (.waitFor osmium-geojsonseq-export-process)]
           (when-not (zero? exit-code)
             (throw (ex-info "osmium export process failed"
