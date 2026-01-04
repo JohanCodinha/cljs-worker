@@ -26,6 +26,17 @@
    "TAS" "IDT60910"
    "NT"  "IDD60910"})
 
+;; Capital cities with verified WMO station IDs and coordinates
+(def capital-cities
+  [{:name "Sydney"    :state "NSW" :wmo "94768" :lat -33.8688 :lon 151.2093}
+   {:name "Melbourne" :state "VIC" :wmo "95936" :lat -37.8136 :lon 144.9631}
+   {:name "Brisbane"  :state "QLD" :wmo "94576" :lat -27.4698 :lon 153.0251}
+   {:name "Perth"     :state "WA"  :wmo "94608" :lat -31.9505 :lon 115.8605}
+   {:name "Adelaide"  :state "SA"  :wmo "94648" :lat -34.9285 :lon 138.6007}
+   {:name "Hobart"    :state "TAS" :wmo "94970" :lat -42.8821 :lon 147.3272}
+   {:name "Darwin"    :state "NT"  :wmo "94120" :lat -12.4634 :lon 130.8456}
+   {:name "Canberra"  :state "ACT" :wmo "94926" :lat -35.2809 :lon 149.1300}])
+
 ;; BOM forecast icon code to name mapping
 ;; Source: https://reg.bom.gov.au/info/forecast_icons.shtml
 (def icon-code->name
@@ -274,6 +285,27 @@
         (.catch (fn [_] (js/Promise.resolve nil))))
     (js/Promise.resolve nil)))
 
+(defn fetch-observation-history-by-wmo
+  "Fetch full 72-hour observation history for a specific WMO station ID.
+   Returns a promise that resolves with a vector of observations (newest first) or nil."
+  [state-code wmo-id]
+  (if-let [feed-id (get state->obs-feed-id state-code)]
+    (-> (js/fetch (obs-json-url feed-id wmo-id))
+        (.then (fn [response]
+                 (if (.-ok response)
+                   (.json response)
+                   (js/Promise.resolve nil))))
+        (.then (fn [json]
+                 (when json
+                   (when-let [data (some-> json
+                                           (aget "observations")
+                                           (aget "data"))]
+                     (let [len (.-length data)]
+                       (when (pos? len)
+                         (mapv #(transform-observation (aget data %)) (range len))))))))
+        (.catch (fn [_] (js/Promise.resolve nil))))
+    (js/Promise.resolve nil)))
+
 ;; -----------------------------------------------------------------------------
 ;; Multi-station observation fetching (for SSR pages)
 
@@ -316,6 +348,7 @@
 (defn fetch-observations-multi
   "Fetch observations from multiple stations, merging data.
    Prefers data from closer stations. Tracks source of each field.
+   Also fetches 72-hour history from the closest station with temperature data.
    stations is a vector of {:obs_wmo :obs_name :distance_km :rank}"
   [state-code stations]
   (if (empty? stations)
@@ -323,5 +356,91 @@
     (let [fetch-promises (mapv #(fetch-observation-by-wmo state-code (:obs_wmo %)) stations)]
       (-> (js/Promise.all (clj->js fetch-promises))
           (.then (fn [results]
-                   (let [observations (js->clj results :keywordize-keys true)]
-                     (merge-observations stations observations))))))))
+                   (let [observations (js->clj results :keywordize-keys true)
+                         merged (merge-observations stations observations)
+                         ;; Find which station provided temp_c
+                         temp-source (get-in merged [:sources :temp_c])
+                         temp-station (when temp-source
+                                        (first (filter #(= (:obs_name %) (:station temp-source)) stations)))]
+                     ;; Fetch history from the station that provided temperature
+                     (if temp-station
+                       (-> (fetch-observation-history-by-wmo state-code (:obs_wmo temp-station))
+                           (.then (fn [history]
+                                    (assoc merged :history history))))
+                       (js/Promise.resolve merged)))))))))
+
+;; -----------------------------------------------------------------------------
+;; Bulk observation fetching (for map display)
+
+(defn fetch-current-temps
+  "Fetch current temperature for multiple stations in parallel.
+   stations is a vector of {:obs_wmo :state ...}
+   Returns a promise resolving to a map of wmo -> temp_c (or nil if unavailable)."
+  [stations]
+  (if (empty? stations)
+    (js/Promise.resolve {})
+    (let [fetch-promises (mapv (fn [{:keys [obs_wmo state]}]
+                                 (-> (fetch-observation-by-wmo state obs_wmo)
+                                     (.then (fn [obs]
+                                              [obs_wmo (:temp_c obs)]))
+                                     (.catch (fn [_] [obs_wmo nil]))))
+                               stations)]
+      (-> (js/Promise.all (clj->js fetch-promises))
+          (.then (fn [results]
+                   (into {} (js->clj results))))))))
+
+;; -----------------------------------------------------------------------------
+;; Capital cities weather fetching (for home page map)
+
+(defn- derive-condition
+  "Derive a simple weather condition from observation data.
+   Returns a condition string like 'Sunny', 'Cloudy', 'Rain', etc."
+  [{:keys [cloud rain_24hr_mm wind_speed_kmh]}]
+  (cond
+    (and rain_24hr_mm (> rain_24hr_mm 0)) "Rain"
+    (= cloud "Overcast") "Cloudy"
+    (and cloud (str/includes? cloud "Mostly")) "Cloudy"
+    (and cloud (str/includes? cloud "Partly")) "Partly Cloudy"
+    (and wind_speed_kmh (> wind_speed_kmh 40)) "Windy"
+    :else "Sunny"))
+
+(def ^:private condition->icon
+  "Map weather conditions to emoji icons for map display."
+  {"Rain"         "🌧️"
+   "Cloudy"       "☁️"
+   "Partly Cloudy" "⛅"
+   "Windy"        "💨"
+   "Sunny"        "☀️"})
+
+(defn- format-weather-label
+  "Format temperature and condition as a map label.
+   Returns string like '24° Sunny' or '--' if no data."
+  [obs]
+  (if-let [temp (:temp_c obs)]
+    (str (js/Math.round temp) "° " (derive-condition obs))
+    "--"))
+
+(defn fetch-capitals-weather
+  "Fetch current weather for all capital cities.
+   Returns a promise resolving to GeoJSON FeatureCollection."
+  []
+  (let [fetch-promises (mapv (fn [{:keys [state wmo]}]
+                               (-> (fetch-observation-by-wmo state wmo)
+                                   (.catch (fn [_] nil))))
+                             capital-cities)]
+    (-> (js/Promise.all (clj->js fetch-promises))
+        (.then (fn [results]
+                 (let [observations (js->clj results :keywordize-keys true)
+                       conditions (mapv derive-condition observations)]
+                   {:type "FeatureCollection"
+                    :features (mapv (fn [city obs condition]
+                                      {:type "Feature"
+                                       :geometry {:type "Point"
+                                                  :coordinates [(:lon city) (:lat city)]}
+                                       :properties {:name (:name city)
+                                                    :temp (when (:temp_c obs)
+                                                            (str (js/Math.round (:temp_c obs)) "°"))
+                                                    :condition condition
+                                                    :icon (get condition->icon condition "🌡️")
+                                                    :label (format-weather-label obs)}})
+                                    capital-cities observations conditions)}))))))
