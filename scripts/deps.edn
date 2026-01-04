@@ -1,3 +1,4 @@
 {:deps {org.clojure/data.json {:mvn/version "2.5.0"}
         com.github.albfernandez/javadbf {:mvn/version "1.14.1"}
-        com.github.seancorfield/honeysql {:mvn/version "2.7.1364"}}}
+        com.github.seancorfield/honeysql {:mvn/version "2.7.1364"}
+        commons-net/commons-net {:mvn/version "3.11.1"}}}

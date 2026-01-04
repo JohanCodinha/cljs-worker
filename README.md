@@ -81,11 +81,40 @@ curl "http://localhost:8787/api/forecast?q=Melbourne"
       }
     ]
   },
-  "other_matches": [...]
+  "other_matches": [...],
+  "refreshed_at": "2026-01-01T10:30:00.000Z"
 }
 ```
 
+The `refreshed_at` field indicates when the places database was last updated.
+
 **Icon values:** `sunny`, `clear`, `partly-cloudy`, `cloudy`, `hazy`, `light-rain`, `windy`, `fog`, `showers`, `rain`, `dusty`, `frost`, `snow`, `storm`, `light-showers`, `heavy-showers`, `cyclone`
+
+## Server-Side Rendering with Replicant
+
+This project uses [Replicant](https://github.com/cjohansen/replicant) for server-side HTML rendering from Hiccup.
+
+### Raw/Unescaped Content
+
+By default, Replicant escapes text content (e.g., `"` becomes `&quot;`). To embed raw content like JSON, use the `:innerHTML` attribute:
+
+```clojure
+;; Text content is escaped (quotes become &quot;)
+[:script (js/JSON.stringify data)]
+;; => <script>{&quot;key&quot;: &quot;value&quot;}</script>
+
+;; :innerHTML bypasses escaping
+[:script {:type "application/json" :id "my-data"
+          :innerHTML (js/JSON.stringify data)}]
+;; => <script type="application/json" id="my-data">{"key": "value"}</script>
+```
+
+**Key points:**
+- `:innerHTML` works like React's `dangerouslySetInnerHTML`
+- Child elements are ignored when `:innerHTML` is set
+- Can be combined with other attributes (`:id`, `:class`, etc.)
+
+**Source:** Found in `replicant/src/replicant/string.cljc` lines 132-133 and tested in `replicant/test/replicant/string_test.cljc` lines 185-197.
 
 ## Project Structure
 
@@ -93,7 +122,9 @@ curl "http://localhost:8787/api/forecast?q=Melbourne"
 src/main/worker/
 ├── core.cljs   # Entry point, route definitions, API handlers
 ├── ring.cljs   # Ring adapter for Cloudflare (includes D1 bindings)
-└── bom.cljs    # BOM weather data fetching with streaming SAX parsing
+├── bom.cljs    # BOM weather data fetching with streaming SAX parsing
+├── views.cljs  # Server-side rendered HTML views
+└── client.cljs # Client-side JavaScript (autocomplete, maps)
 ```
 
 ## Development
@@ -129,47 +160,48 @@ Australian places database for geocoding, sourced from OpenStreetMap. Each place
 
 **IDM00013.dbf** - BOM Forecast Locations (~684 locations)
 - DBF file from the Bureau of Meteorology containing official forecast locations
-- Source: `ftp://ftp.bom.gov.au/anon/home/adfd/spatial/IDM00013.dbf`
+- Streamed directly from: `ftp://ftp.bom.gov.au/anon/home/adfd/spatial/IDM00013.dbf`
 
 **ID*60920.xml** - BOM Observation Stations (~600 stations)
 - Live weather observation feeds from weather stations across Australia
-- Source: `http://reg.bom.gov.au/fwo/IDV60920.xml` (one per state)
+- Streamed from: `http://reg.bom.gov.au/fwo/IDV60920.xml` (one per state)
 
 **australia.osm.pbf** - OpenStreetMap Places (~100,000 places)
 - Cities, towns, suburbs, landmarks, and points of interest
-- Source: `https://download.geofabrik.de/australia-oceania/australia-latest.osm.pbf`
+- Downloaded automatically from: `https://download.geofabrik.de/australia-oceania/australia-latest.osm.pbf`
 
 **How They're Combined**
 
 The `scripts/process_pbf.clj` script:
-1. Fetches observation station metadata from all 8 state feeds
-2. Parses BOM forecast locations from the DBF file
-3. Computes nearest observation station for each forecast location
-4. Extracts interesting places from the OSM PBF file
-5. Computes nearest BOM forecast location for each OSM place
-6. Generates `data/places.sql` with all pre-computed mappings
+1. Downloads the OSM PBF file if not present locally
+2. Checks if data sources have changed since last run (via D1 metadata)
+3. Streams BOM forecast locations directly from FTP
+4. Fetches observation station metadata from all 8 state feeds
+5. Computes nearest observation station for each forecast location
+6. Extracts interesting places from the OSM PBF file
+7. Computes nearest BOM forecast location for each OSM place
+8. Generates `data/places.sql` with all pre-computed mappings
+9. Records metadata (sequence numbers, timestamps) for change detection
 
 This enables instant weather lookups—search for any place and get both the 7-day forecast and live observations without runtime distance calculations.
 
 ### Quick Start
 
 ```bash
-# 1. Download source data
-mkdir -p data/bom
-curl -o data/bom/IDM00013.dbf ftp://ftp.bom.gov.au/anon/home/adfd/spatial/IDM00013.dbf
-curl -L -o data/australia.osm.pbf https://download.geofabrik.de/australia-oceania/australia-latest.osm.pbf
-
-# 2. Process PBF to SQL (requires: brew install osmium-tool)
-# This fetches observation stations, processes BOM locations, and extracts OSM places
+# 1. Process data to SQL (requires: brew install osmium-tool)
+# Downloads PBF if missing, streams BOM data, checks for changes, generates SQL
 cd scripts && clj -M process_pbf.clj config.edn && cd ..
 
-# 3. Seed local D1 database
+# 2. Seed local D1 database
 wrangler d1 execute places-db --local --file data/places.sql
 
-# 4. Verify
+# 3. Verify
 wrangler d1 execute places-db --local \
   --command "SELECT name, state, bom_aac, obs_wmo FROM bom_locations WHERE name = 'Melbourne';"
 ```
+
+**Re-running the script:**
+The script automatically checks if data sources have changed. If nothing has changed, it exits early without regenerating the SQL. Use `:force? true` in config.edn to force regeneration.
 
 ### Database Stats
 

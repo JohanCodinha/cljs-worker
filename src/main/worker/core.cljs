@@ -98,6 +98,61 @@
       (.then (fn [^js result]
                (js->clj (.-results result) :keywordize-keys true)))))
 
+(defn- search-stations
+  "Search for observation stations matching query."
+  [^js db query]
+  (-> (.prepare db "SELECT DISTINCT obs_wmo, obs_name,
+                           (SELECT state FROM bom_locations WHERE aac = bom_obs_stations.aac LIMIT 1) as state
+                    FROM bom_obs_stations
+                    WHERE obs_name LIKE ?
+                    ORDER BY obs_name
+                    LIMIT 10")
+      (.bind (str "%" query "%"))
+      (.all)
+      (.then (fn [^js result]
+               (js->clj (.-results result) :keywordize-keys true)))))
+
+(defn- get-all-stations
+  "Get all unique observation stations with coordinates for map display."
+  [^js db]
+  (-> (.prepare db "SELECT DISTINCT obs_wmo, obs_name, obs_lat, obs_lon,
+                           (SELECT state FROM bom_locations WHERE aac = bom_obs_stations.aac LIMIT 1) as state
+                    FROM bom_obs_stations
+                    WHERE obs_lat IS NOT NULL AND obs_lon IS NOT NULL
+                    ORDER BY obs_name")
+      (.all)
+      (.then (fn [^js result]
+               (js->clj (.-results result) :keywordize-keys true)))))
+
+(defn- get-stations-in-bounds
+  "Get stations within geographic bounds for map display."
+  [^js db min-lon min-lat max-lon max-lat]
+  (-> (.prepare db "SELECT DISTINCT obs_wmo, obs_name, obs_lat, obs_lon,
+                           (SELECT state FROM bom_locations WHERE aac = bom_obs_stations.aac LIMIT 1) as state
+                    FROM bom_obs_stations
+                    WHERE obs_lat IS NOT NULL AND obs_lon IS NOT NULL
+                      AND obs_lon >= ? AND obs_lon <= ?
+                      AND obs_lat >= ? AND obs_lat <= ?
+                    ORDER BY obs_name")
+      (.bind min-lon max-lon min-lat max-lat)
+      (.all)
+      (.then (fn [^js result]
+               (js->clj (.-results result) :keywordize-keys true)))))
+
+(defn- get-station-by-wmo
+  "Get station details by WMO ID."
+  [^js db wmo]
+  (-> (.prepare db "SELECT obs_wmo, obs_name, obs_lat, obs_lon,
+                           (SELECT state FROM bom_locations WHERE aac = bom_obs_stations.aac LIMIT 1) as state
+                    FROM bom_obs_stations
+                    WHERE obs_wmo = ?
+                    LIMIT 1")
+      (.bind wmo)
+      (.first)
+      (.then (fn [^js result]
+               (when result
+                 (js->clj result :keywordize-keys true))))))
+
 (defn- forecast-handler
   "Returns forecast data for matching locations.
    Query param 'q' is validated by Malli coercion.
@@ -142,13 +197,16 @@
 ;; SSR Handlers
 
 (defn- home-handler
-  "Renders the home page with search autocomplete."
+  "Renders the home page with search autocomplete and capitals weather map."
   [{:keys [^js env]}]
   (let [db (.-PLACES_DB env)]
-    (-> (get-example-places db)
-        (.then (fn [examples]
-                 (ring/html-response
-                  (views/home-page {:examples examples})))))))
+    (-> (js/Promise.all #js [(get-example-places db)
+                              (bom/fetch-capitals-weather)])
+        (.then (fn [results]
+                 (let [[examples capitals-weather] (js->clj results :keywordize-keys true)]
+                   (ring/html-response
+                    (views/home-page {:examples examples
+                                      :capitals-weather capitals-weather}))))))))
 
 (defn- places-search-handler
   "API endpoint for autocomplete - returns JSON list of matching places."
@@ -190,6 +248,73 @@
                                                     :forecast forecast
                                                     :other-matches other-matches}))))))))))))))))
 
+(defn- stations-search-handler
+  "API endpoint for station autocomplete - returns JSON list of matching stations."
+  [{:keys [parameters ^js env]}]
+  (let [{:keys [q]} (:query parameters)
+        db (.-PLACES_DB env)]
+    (-> (search-stations db q)
+        (.then (fn [stations]
+                 (ring/json-response
+                  (mapv #(select-keys % [:obs_wmo :obs_name :state]) stations)))))))
+
+(defn- stations-geojson-handler
+  "API endpoint returning all stations as GeoJSON for map display."
+  [{:keys [^js env]}]
+  (let [db (.-PLACES_DB env)]
+    (-> (get-all-stations db)
+        (.then (fn [stations]
+                 (ring/json-response
+                  {:type "FeatureCollection"
+                   :features (mapv (fn [{:keys [obs_wmo obs_name obs_lat obs_lon state]}]
+                                     {:type "Feature"
+                                      :geometry {:type "Point"
+                                                 :coordinates [obs_lon obs_lat]}
+                                      :properties {:wmo obs_wmo
+                                                   :name obs_name
+                                                   :state state}})
+                                   stations)}))))))
+
+(defn- stations-temps-handler
+  "API endpoint returning current temperatures for stations in bounds.
+   Query params: bounds=minLon,minLat,maxLon,maxLat"
+  [{:keys [parameters ^js env]}]
+  (let [{:keys [bounds]} (:query parameters)
+        db (.-PLACES_DB env)
+        [min-lon min-lat max-lon max-lat] (mapv js/parseFloat (.split bounds ","))]
+    (-> (get-stations-in-bounds db min-lon min-lat max-lon max-lat)
+        (.then (fn [stations]
+                 (-> (bom/fetch-current-temps stations)
+                     (.then (fn [temps]
+                              (ring/json-response temps)))))))))
+
+(defn- stations-page-handler
+  "Renders the stations list page with search autocomplete."
+  [_request]
+  (ring/html-response
+   (views/stations-list-page {})))
+
+(defn- station-page-handler
+  "Renders the station detail page with current conditions and temperature graph."
+  [{:keys [parameters ^js env]}]
+  (let [{:keys [wmo]} (:path parameters)
+        db (.-PLACES_DB env)]
+    (-> (get-station-by-wmo db wmo)
+        (.then
+         (fn [station]
+           (if-not station
+             (ring/html-response (views/not-found-page (str "Station " wmo)) 404)
+             (let [state (:state station)]
+               (-> (bom/fetch-observation-history-by-wmo state wmo)
+                   (.then
+                    (fn [history]
+                      (let [current (first history)]
+                        (ring/html-response
+                         (views/station-page
+                          {:station station
+                           :observation (when current
+                                          (assoc current :history history))})))))))))))))
+
 (def router
   (r/router
    [;; SSR pages
@@ -199,6 +324,12 @@
                         :handler forecast-page-handler
                         :coercion malli/coercion
                         :parameters {:path [:map [:slug :string]]}}]
+    ["/stations" {:name ::stations-page
+                  :handler stations-page-handler}]
+    ["/station/:wmo" {:name ::station-page
+                      :handler station-page-handler
+                      :coercion malli/coercion
+                      :parameters {:path [:map [:wmo :string]]}}]
 
     ;; API endpoints
     ["/api/hello" {:name ::api-hello
@@ -207,6 +338,16 @@
                     :handler places-search-handler
                     :coercion malli/coercion
                     :parameters {:query [:map [:q :string]]}}]
+    ["/api/stations" {:name ::api-stations
+                      :handler stations-search-handler
+                      :coercion malli/coercion
+                      :parameters {:query [:map [:q :string]]}}]
+    ["/api/stations/geojson" {:name ::api-stations-geojson
+                              :handler stations-geojson-handler}]
+    ["/api/stations/temps" {:name ::api-stations-temps
+                            :handler stations-temps-handler
+                            :coercion malli/coercion
+                            :parameters {:query [:map [:bounds :string]]}}]
     ["/api/forecast" {:name ::api-forecast
                       :handler forecast-handler
                       :coercion malli/coercion

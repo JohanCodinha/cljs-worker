@@ -287,28 +287,42 @@
        [:a {:href (str "/forecast/" slug)} (str name ", " state)])]))
 
 (defn home-page
-  "Home page with search autocomplete"
-  [{:keys [examples]}]
-  (layout
-   {:title "Australian Weather Forecast"
-    :include-client-js? true}
-   [:h1 "Australian Weather Forecast"]
-   [:p.subtitle "Search for any Australian city or town"]
-   [:div.search-box
-    [:input#search {:type "text"
-                    :placeholder "Enter city name..."
-                    :autocomplete "off"}]
-    [:div#suggestions.suggestions]]
-   [:div.examples
-    "Try: "
-    (for [{:keys [name slug]} examples]
-      [:a {:href (str "/forecast/" slug)} name])]
-   [:div.stations-link
-    [:a {:href "/stations"} "Browse all weather stations →"]]
-   [:div.tech-stack
-    "Built with ClojureScript + shadow-cljs + Reitit + Cloudflare Workers"
-    [:br]
-    "Data from Bureau of Meteorology"]))
+  "Home page with search autocomplete and capitals weather map"
+  [{:keys [examples capitals-weather]}]
+  (str "<!DOCTYPE html>"
+       (r/render
+        [:html {:lang "en"}
+         [:head
+          [:meta {:charset "UTF-8"}]
+          [:meta {:name "viewport" :content "width=device-width, initial-scale=1.0"}]
+          [:title "Australian Weather Forecast"]
+          [:link {:rel "stylesheet" :href "/styles.css"}]
+          [:link {:rel "stylesheet" :href "https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"}]
+          [:script {:src "https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"}]]
+         [:body
+          [:div.container
+           [:h1 "Weather Forecast"]
+           [:p.subtitle "Search for any Australian city or town"]
+           [:div.search-box
+            [:input#search {:type "text"
+                            :placeholder "Enter city name..."
+                            :autocomplete "off"}]
+            [:div#suggestions.suggestions]]
+           [:div#capitals-map.capitals-map]
+           [:div.examples
+            "Try: "
+            (for [{:keys [name slug]} examples]
+              [:a {:href (str "/forecast/" slug)} name])]
+           [:div.stations-link
+            [:a {:href "/stations"} "Browse all weather stations →"]]
+           [:div.tech-stack
+            "Built with ClojureScript + shadow-cljs + Reitit + Cloudflare Workers"
+            [:br]
+            "Data from Bureau of Meteorology"]]
+          ;; Use :innerHTML to bypass HTML escaping for JSON data
+          [:script {:type "application/json" :id "capitals-data"
+                    :innerHTML (js/JSON.stringify (clj->js capitals-weather))}]
+          [:script {:src "/js/client.js" :defer true}]]])))
 
 (defn forecast-page
   "Forecast page for a specific location"
