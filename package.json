@@ -1,11 +1,11 @@
 {
-  "name": "reitit-cf-demo",
+  "name": "sunburnt",
   "version": "0.0.1",
   "private": true,
   "scripts": {
-    "dev": "concurrently -n cljs,worker -c blue,green \"npx shadow-cljs watch worker\" \"npx wrangler dev\"",
-    "watch": "npx shadow-cljs watch worker",
-    "release": "npx shadow-cljs release worker",
+    "dev": "npx shadow-cljs compile worker client && concurrently -n cljs,worker -c blue,green \"npx shadow-cljs watch worker client\" \"npx wrangler dev\"",
+    "watch": "npx shadow-cljs watch worker client",
+    "release": "npx shadow-cljs release worker client",
     "wrangler": "npx wrangler dev",
     "deploy": "npx wrangler deploy"
   },
